@@ -32,6 +32,7 @@ func newReviewCommand() *cobra.Command {
 
 	cmd.Flags().BoolVar(&opts.Start, "start", false, "Open a pending review")
 	cmd.Flags().BoolVar(&opts.AddComment, "add-comment", false, "Add an inline comment to a pending review")
+	cmd.Flags().BoolVar(&opts.AddBatch, "add-batch", false, "Add multiple inline comments to a pending review (filters duplicates by similarity)")
 	cmd.Flags().BoolVar(&opts.Submit, "submit", false, "Submit a pending review")
 
 	cmd.Flags().StringVar(&opts.Commit, "commit", "", "Commit SHA for review start (defaults to current head)")
@@ -42,6 +43,7 @@ func newReviewCommand() *cobra.Command {
 	cmd.Flags().IntVar(&opts.StartLine, "start-line", 0, "Start line for multi-line comments")
 	cmd.Flags().StringVar(&opts.StartSide, "start-side", "", "Start side for multi-line comments")
 	cmd.Flags().StringVar(&opts.Body, "body", "", "Comment or review body")
+	cmd.Flags().StringVar(&opts.BatchFile, "batch-file", "", "JSON file containing an array of comments for batch mode")
 	cmd.Flags().StringVar(&opts.Event, "event", opts.Event, "Review submission event (APPROVE, COMMENT, REQUEST_CHANGES)")
 
 	cmd.AddCommand(newReviewViewCommand())
@@ -56,6 +58,7 @@ type reviewOptions struct {
 
 	Start      bool
 	AddComment bool
+	AddBatch   bool
 	Submit     bool
 
 	Commit    string
@@ -66,11 +69,12 @@ type reviewOptions struct {
 	StartLine int
 	StartSide string
 	Body      string
+	BatchFile string
 	Event     string
 }
 
 func runReview(cmd *cobra.Command, opts *reviewOptions) error {
-	actions := []bool{opts.Start, opts.AddComment, opts.Submit}
+	actions := []bool{opts.Start, opts.AddComment, opts.AddBatch, opts.Submit}
 	enabled := 0
 	for _, flag := range actions {
 		if flag {
@@ -78,7 +82,7 @@ func runReview(cmd *cobra.Command, opts *reviewOptions) error {
 		}
 	}
 	if enabled != 1 {
-		return errors.New("specify exactly one of --start, --add-comment, or --submit")
+		return errors.New("specify exactly one of --start, --add-comment, --add-batch, or --submit")
 	}
 
 	selector, err := resolver.NormalizeSelector(opts.Selector, opts.Pull)
@@ -99,6 +103,8 @@ func runReview(cmd *cobra.Command, opts *reviewOptions) error {
 		return executeReviewStart(cmd, service, identity, opts)
 	case opts.AddComment:
 		return executeReviewAddComment(cmd, service, identity, opts)
+	case opts.AddBatch:
+		return executeReviewAddBatch(cmd, service, identity, opts)
 	default: // Submit
 		return executeReviewSubmit(cmd, service, identity, opts)
 	}
@@ -153,6 +159,57 @@ func executeReviewAddComment(cmd *cobra.Command, service *reviewsvc.Service, pr 
 		return err
 	}
 	return encodeJSON(cmd, thread)
+}
+
+func executeReviewAddBatch(cmd *cobra.Command, service *reviewsvc.Service, pr resolver.Identity, opts *reviewOptions) error {
+	reviewID, err := ensureGraphQLReviewID(opts.ReviewID)
+	if err != nil {
+		return err
+	}
+
+	if opts.BatchFile == "" {
+		return errors.New("--batch-file is required for batch mode")
+	}
+
+	data, err := os.ReadFile(opts.BatchFile)
+	if err != nil {
+		return fmt.Errorf("reading batch file: %w", err)
+	}
+
+	var rawInputs []struct {
+		Path      string `json:"path"`
+		Line      int    `json:"line"`
+		Side      string `json:"side"`
+		StartLine *int   `json:"start_line"`
+		StartSide *string `json:"start_side"`
+		Body      string `json:"body"`
+	}
+	if err := json.Unmarshal(data, &rawInputs); err != nil {
+		return fmt.Errorf("parsing batch file: %w", err)
+	}
+
+	inputs := make([]reviewsvc.ThreadInput, len(rawInputs))
+	for i, r := range rawInputs {
+		side := "RIGHT"
+		if r.Side != "" {
+			side = r.Side
+		}
+		inputs[i] = reviewsvc.ThreadInput{
+			ReviewID:  reviewID,
+			Path:      r.Path,
+			Line:      r.Line,
+			Side:      side,
+			StartLine: r.StartLine,
+			StartSide: r.StartSide,
+			Body:      r.Body,
+		}
+	}
+
+	threads, err := service.AddBatch(pr, inputs)
+	if err != nil {
+		return err
+	}
+	return encodeJSON(cmd, threads)
 }
 
 func executeReviewSubmit(cmd *cobra.Command, service *reviewsvc.Service, pr resolver.Identity, opts *reviewOptions) error {

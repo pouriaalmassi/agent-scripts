@@ -10,8 +10,9 @@ A GitHub CLI extension that provides complete inline PR review comment access fr
 ## Core Features
 
 1.  **Review GitHub PRs:** Full lifecycle support (Start, Add Comments, Submit).
-2.  **Duplicate Prevention:** Automatically blocks duplicate inline comments on the same file and line by the same user.
-3.  **One-Shot Review:** Designed for a seamless "One-Shot" experience where an agent performs a full review given only a PR URL.
+2.  **Duplicate Prevention:** Automatically blocks duplicate inline comments if the content matches or is highly similar (>= 80%) to an existing comment on the same line or anywhere else in the pull request (same issue prevention).
+3.  **Batch Processing:** Support for adding multiple comments at once with automatic filtering of similar issues.
+4.  **One-Shot Review:** Designed for a seamless "One-Shot" experience where an agent performs a full review given only a PR URL.
 
 ## One-Shot Review Workflow
 
@@ -22,10 +23,11 @@ When given a PR URL or repository information, the agent should:
 3.  **Perform Analysis:** Identify code quality issues, bugs, or improvements.
 4.  **Execute Review:**
     *   `gh pr-review review --start <URL>` to open a review.
-    *   `gh pr-review review --add-comment <URL> --path <file> --line <line> --body "..."` for each finding.
+    *   `gh pr-review review --add-batch <URL> --review-id <ID> --batch-file <json-file>` to submit all findings at once.
+    *   The skill will filter out any findings that are similar to existing comments or to each other in the same batch.
     *   `gh pr-review review --submit <URL> --event <EVENT> --body "Summary"` to finish.
 
-The skill will automatically prevent duplicate comments at the `add-comment` and `submit` stages.
+The skill will automatically prevent duplicate comments at the `add-comment` and `add-batch` stages by checking existing thread content for similarity.
 
 ## Core Commands
 ...
@@ -81,7 +83,22 @@ Start a pending review:
 gh pr-review review --start -R owner/repo <pr-number>
 ```
 
-Add inline comments to pending review:
+Add inline comments in batch (Recommended):
+
+```sh
+# Prepare a comments.json file:
+# [
+#   {"path": "file.go", "line": 10, "body": "nit: use helper"},
+#   {"path": "other.go", "line": 20, "body": "consider refactoring"}
+# ]
+
+gh pr-review review --add-batch \
+  --review-id <PRR_...> \
+  --batch-file comments.json \
+  -R owner/repo <pr-number>
+```
+
+Add inline comments one by one:
 
 ```sh
 gh pr-review review --add-comment \

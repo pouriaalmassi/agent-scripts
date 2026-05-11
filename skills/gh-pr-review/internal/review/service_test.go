@@ -104,22 +104,34 @@ func TestServiceStart(t *testing.T) {
 func TestServiceAddThread_FailsIfDuplicateAtLine(t *testing.T) {
 	api := &fakeAPI{}
 	api.graphqlFunc = func(query string, variables map[string]interface{}, result interface{}) error {
-		if strings.Contains(query, "ViewerLogin") {
+		if strings.Contains(query, "reviewThreads") {
 			payload := map[string]interface{}{
-				"viewer": map[string]interface{}{
-					"login": "me",
+				"repository": map[string]interface{}{
+					"pullRequest": map[string]interface{}{
+						"reviewThreads": map[string]interface{}{
+							"nodes": []map[string]interface{}{
+								{
+									"path": "file.go",
+									"line": 10,
+									"comments": map[string]interface{}{
+										"nodes": []map[string]interface{}{
+											{"body": "note", "author": map[string]interface{}{"login": "me"}},
+										},
+									},
+								},
+							},
+						},
+					},
 				},
 			}
 			return assign(result, payload)
 		}
 		return errors.New("unexpected GraphQL call")
 	}
-	api.execFunc = func(args ...string) ([]byte, string, error) {
-		return []byte(`{"reviewThreads":[{"path":"file.go", "line":10, "comments":[{"author":{"login":"me"}}]}]}`), "", nil
-	}
 
 	svc := NewService(api)
 	pr := resolver.Identity{Owner: "octo", Repo: "demo", Number: 7, Host: "github.com"}
+	// Fails because body "note" matches existing comment
 	_, err := svc.AddThread(pr, ThreadInput{ReviewID: "PRR_review", Path: "file.go", Line: 10, Body: "note"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already exists on file.go:10")
@@ -364,6 +376,59 @@ func TestServiceSubmitErrorOnMissingReviewID(t *testing.T) {
 	_, err := svc.Submit(pr, SubmitInput{ReviewID: " ", Event: "APPROVE"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "review id is required")
+}
+
+func TestServiceAddThread_DuplicateBodyDetection(t *testing.T) {
+	api := &fakeAPI{}
+	api.graphqlFunc = func(query string, variables map[string]interface{}, result interface{}) error {
+		if strings.Contains(query, "reviewThreads") {
+			payload := map[string]interface{}{
+				"repository": map[string]interface{}{
+					"pullRequest": map[string]interface{}{
+						"reviewThreads": map[string]interface{}{
+							"nodes": []map[string]interface{}{
+								{
+									"path": "file.go",
+									"line": 10,
+									"comments": map[string]interface{}{
+										"nodes": []map[string]interface{}{
+											{"body": "duplicate me", "author": map[string]interface{}{"login": "me"}},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			return assign(result, payload)
+		}
+		if strings.Contains(query, "addPullRequestReviewThread") {
+			return assign(result, map[string]interface{}{
+				"addPullRequestReviewThread": map[string]interface{}{
+					"thread": map[string]interface{}{"id": "THR2", "path": "file.go", "isOutdated": false, "line": 10},
+				},
+			})
+		}
+		return errors.New("unexpected GraphQL call")
+	}
+
+	svc := NewService(api)
+	pr := resolver.Identity{Owner: "octo", Repo: "demo", Number: 7, Host: "github.com"}
+
+	// 1. Same line, same body -> Should Fail
+	_, err := svc.AddThread(pr, ThreadInput{ReviewID: "PRR_review", Path: "file.go", Line: 10, Body: "duplicate me"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "same content already exists on file.go:10")
+
+	// 2. Different line, same body -> Should Fail (per "never comment on the same issue")
+	_, err = svc.AddThread(pr, ThreadInput{ReviewID: "PRR_review", Path: "other.go", Line: 20, Body: "duplicate me"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "same content already exists in this pull request")
+
+	// 3. Same line, different body -> Should Succeed
+	_, err = svc.AddThread(pr, ThreadInput{ReviewID: "PRR_review", Path: "file.go", Line: 10, Body: "different note"})
+	require.NoError(t, err)
 }
 
 func assign(result interface{}, payload interface{}) error {

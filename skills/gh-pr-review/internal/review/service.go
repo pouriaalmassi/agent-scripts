@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/agynio/gh-pr-review/internal/ghcli"
 	"github.com/agynio/gh-pr-review/internal/resolver"
@@ -16,149 +17,116 @@ type Service struct {
 	API ghcli.API
 }
 
-// ErrViewerLoginUnavailable indicates the authenticated viewer login could not be resolved via GraphQL.
-var ErrViewerLoginUnavailable = errors.New("viewer login unavailable")
+const similarityThreshold = 0.8
 
-// ReviewState contains metadata about a review after opening or submitting it.
-type ReviewState struct {
-	ID          string  `json:"id"`
-	State       string  `json:"state"`
-	SubmittedAt *string `json:"submitted_at,omitempty"`
-}
-
-// SubmitStatus represents the outcome of a review submission mutation.
-type SubmitStatus struct {
-	Success bool
-	Errors  []ghcli.GraphQLErrorEntry
-}
-
-// ReviewThread represents an inline comment thread added to a pending review.
-type ReviewThread struct {
-	ID         string `json:"id"`
-	Path       string `json:"path"`
-	IsOutdated bool   `json:"is_outdated"`
-	Line       *int   `json:"line,omitempty"`
-}
-
-// ThreadInput describes the inline comment details for AddThread.
-type ThreadInput struct {
-	ReviewID  string
-	Path      string
-	Line      int
-	Side      string
-	StartLine *int
-	StartSide *string
-	Body      string
-}
-
-// SubmitInput contains the payload for submitting a pending review.
-type SubmitInput struct {
-	ReviewID string
-	Event    string
-	Body     string
-}
-
-// NewService constructs a review Service.
-func NewService(api ghcli.API) *Service {
-	return &Service{API: api}
-}
-
-// Start opens a pending review for the specified pull request.
-func (s *Service) Start(pr resolver.Identity, commitOID string) (*ReviewState, error) {
-	nodeID, headSHA, err := s.pullRequestIdentifiers(pr)
-	if err != nil {
-		return nil, err
+func calculateSimilarity(s1, s2 string) float64 {
+	w1 := tokenize(s1)
+	w2 := tokenize(s2)
+	if len(w1) == 0 || len(w2) == 0 {
+		return 0
 	}
 
-	trimmedCommit := strings.TrimSpace(commitOID)
-	if trimmedCommit == "" {
-		trimmedCommit = headSHA
+	m1 := make(map[string]struct{})
+	for _, w := range w1 {
+		m1[w] = struct{}{}
 	}
 
-	const mutation = `mutation($input:AddPullRequestReviewInput!){
-  addPullRequestReview(input:$input){
-    pullRequestReview { id state submittedAt }
-  }
-}`
-
-	payload := map[string]interface{}{
-		"input": map[string]interface{}{
-			"pullRequestId": nodeID,
-			"commitOID":     trimmedCommit,
-		},
+	m2 := make(map[string]struct{})
+	for _, w := range w2 {
+		m2[w] = struct{}{}
 	}
 
-	var resp struct {
-		AddPullRequestReview struct {
-			PullRequestReview struct {
-				ID          string  `json:"id"`
-				State       string  `json:"state"`
-				SubmittedAt *string `json:"submittedAt"`
-			} `json:"pullRequestReview"`
-		} `json:"addPullRequestReview"`
-	}
-
-	if err := s.API.GraphQL(mutation, payload, &resp); err != nil {
-		return nil, err
-	}
-
-	prr := resp.AddPullRequestReview.PullRequestReview
-	trimmedID := strings.TrimSpace(prr.ID)
-	if trimmedID == "" {
-		return nil, errors.New("addPullRequestReview returned empty id")
-	}
-	trimmedState := strings.TrimSpace(prr.State)
-	if trimmedState == "" {
-		return nil, errors.New("addPullRequestReview returned empty state")
-	}
-	state := ReviewState{ID: trimmedID, State: trimmedState}
-
-	if prr.SubmittedAt != nil {
-		trimmed := strings.TrimSpace(*prr.SubmittedAt)
-		if trimmed != "" {
-			state.SubmittedAt = &trimmed
+	intersect := 0
+	for w := range m1 {
+		if _, ok := m2[w]; ok {
+			intersect++
 		}
 	}
 
-	return &state, nil
+	union := len(m1)
+	for w := range m2 {
+		if _, ok := m1[w]; !ok {
+			union++
+		}
+	}
+
+	return float64(intersect) / float64(union)
 }
 
-func (s *Service) ensureNoExistingCommentAt(pr resolver.Identity, path string, line int) error {
-	viewer, err := s.currentViewer()
+func tokenize(s string) []string {
+	s = strings.ToLower(s)
+	f := func(c rune) bool {
+		return !unicode.IsLetter(c) && !unicode.IsNumber(c)
+	}
+	return strings.FieldsFunc(s, f)
+}
+
+func (s *Service) fetchExistingCommentBodies(pr resolver.Identity) ([]string, error) {
+	const query = `query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      reviewThreads(first:100){
+        nodes {
+          comments(first:100){
+            nodes {
+              body
+            }
+          }
+        }
+      }
+    }
+  }
+}`
+
+	variables := map[string]interface{}{
+		"owner":  pr.Owner,
+		"name":   pr.Repo,
+		"number": pr.Number,
+	}
+
+	var resp struct {
+		Repository *struct {
+			PullRequest *struct {
+				ReviewThreads struct {
+					Nodes []struct {
+						Comments struct {
+							Nodes []struct {
+								Body string `json:"body"`
+							} `json:"nodes"`
+						} `json:"comments"`
+					} `json:"nodes"`
+				} `json:"reviewThreads"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	}
+
+	if err := s.API.GraphQL(query, variables, &resp); err != nil {
+		return nil, fmt.Errorf("fetching existing comments: %w", err)
+	}
+
+	if resp.Repository == nil || resp.Repository.PullRequest == nil {
+		return nil, nil
+	}
+
+	var bodies []string
+	for _, t := range resp.Repository.PullRequest.ReviewThreads.Nodes {
+		for _, c := range t.Comments.Nodes {
+			bodies = append(bodies, c.Body)
+		}
+	}
+	return bodies, nil
+}
+
+func (s *Service) checkForDuplicates(pr resolver.Identity, body string) error {
+	existing, err := s.fetchExistingCommentBodies(pr)
 	if err != nil {
 		return err
 	}
 
-	// Fetch reviewThreads using gh pr view --json
-	args := []string{"pr", "view", strconv.Itoa(pr.Number), "--json", "reviewThreads"}
-	stdout, _, err := s.API.Exec(args...)
-	if err != nil {
-		return fmt.Errorf("checking existing comments: %w", err)
-	}
-
-	var data struct {
-		ReviewThreads []struct {
-			Path     string `json:"path"`
-			Line     int    `json:"line"`
-			Comments []struct {
-				Author struct {
-					Login string `json:"login"`
-				} `json:"author"`
-			} `json:"comments"`
-		} `json:"reviewThreads"`
-	}
-
-	if err := json.Unmarshal(stdout, &data); err != nil {
-		return fmt.Errorf("parsing pr view output: %w", err)
-	}
-
-	for _, t := range data.ReviewThreads {
-		if t.Path == path && t.Line == line {
-			for _, c := range t.Comments {
-				if strings.EqualFold(c.Author.Login, viewer) {
-					return fmt.Errorf("an inline comment by %q already exists on %s:%d; skipping duplicate comment", viewer, path, line)
-				}
-			}
+	trimmedBody := strings.TrimSpace(body)
+	for _, b := range existing {
+		if calculateSimilarity(trimmedBody, b) >= similarityThreshold {
+			return fmt.Errorf("a similar comment already exists in this pull request; skipping duplicate comment (similarity: %.2f)", calculateSimilarity(trimmedBody, b))
 		}
 	}
 
@@ -167,10 +135,14 @@ func (s *Service) ensureNoExistingCommentAt(pr resolver.Identity, path string, l
 
 // AddThread adds an inline review comment thread to an existing pending review.
 func (s *Service) AddThread(pr resolver.Identity, input ThreadInput) (*ReviewThread, error) {
-	if err := s.ensureNoExistingCommentAt(pr, strings.TrimSpace(input.Path), input.Line); err != nil {
+	if err := s.checkForDuplicates(pr, input.Body); err != nil {
 		return nil, err
 	}
 
+	return s.addThreadNoCheck(pr, input)
+}
+
+func (s *Service) addThreadNoCheck(pr resolver.Identity, input ThreadInput) (*ReviewThread, error) {
 	trimmedID := strings.TrimSpace(input.ReviewID)
 	if trimmedID == "" {
 		return nil, errors.New("review id is required")
@@ -243,6 +215,53 @@ func (s *Service) AddThread(pr resolver.Identity, input ThreadInput) (*ReviewThr
 		result.Line = thread.Line
 	}
 	return &result, nil
+}
+
+// AddBatch adds multiple inline review comment threads, filtering out duplicates by similarity.
+func (s *Service) AddBatch(pr resolver.Identity, inputs []ThreadInput) ([]ReviewThread, error) {
+	existing, err := s.fetchExistingCommentBodies(pr)
+	if err != nil {
+		return nil, err
+	}
+
+	var results []ReviewThread
+	var acceptedBodies []string
+
+	for _, input := range inputs {
+		isDuplicate := false
+		trimmedBody := strings.TrimSpace(input.Body)
+
+		// Check against existing comments
+		for _, b := range existing {
+			if calculateSimilarity(trimmedBody, b) >= similarityThreshold {
+				isDuplicate = true
+				break
+			}
+		}
+		if isDuplicate {
+			continue
+		}
+
+		// Check against already accepted comments in this batch
+		for _, b := range acceptedBodies {
+			if calculateSimilarity(trimmedBody, b) >= similarityThreshold {
+				isDuplicate = true
+				break
+			}
+		}
+		if isDuplicate {
+			continue
+		}
+
+		thread, err := s.addThreadNoCheck(pr, input)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, *thread)
+		acceptedBodies = append(acceptedBodies, trimmedBody)
+	}
+
+	return results, nil
 }
 
 // Submit finalizes a pending review with the given event and optional body.
